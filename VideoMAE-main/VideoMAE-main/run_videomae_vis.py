@@ -1,29 +1,25 @@
 # -*- coding: utf-8 -*-
 import argparse
 import numpy as np
-import torch
-import torch.backends.cudnn as cudnn
+import tensorflow as tf
 from PIL import Image
 from pathlib import Path
-from timm.models import create_model
+import cv2
 import utils
-import modeling_pretrain
+import modeling_pretrain  # You need to replace this with your TensorFlow model
 from datasets import DataAugmentationForVideoMAE
-from torchvision.transforms import ToPILImage
+from tensorflow import keras 
+from keras.preprocessing.image import img_to_array, array_to_img
 from einops import rearrange
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from decord import VideoReader, cpu
-from torchvision import transforms
-from transforms import *
-from masking_generator import  TubeMaskingGenerator
 
-class DataAugmentationForVideoMAE(object):
+class DataAugmentationForVideoMAE:
     def __init__(self, args):
-        self.input_mean = [0.485, 0.456, 0.406] # IMAGENET_DEFAULT_MEAN
-        self.input_std = [0.229, 0.224, 0.225] # IMAGENET_DEFAULT_STD
+        self.input_mean = [0.485, 0.456, 0.406]  # IMAGENET_DEFAULT_MEAN
+        self.input_std = [0.229, 0.224, 0.225]  # IMAGENET_DEFAULT_STD
         normalize = GroupNormalize(self.input_mean, self.input_std)
         self.train_augmentation = GroupCenterCrop(args.input_size)
-        self.transform = transforms.Compose([                            
+        self.transform = tf.keras.Sequential([
             self.train_augmentation,
             Stack(roll=False),
             ToTorchFormatTensor(div=True),
@@ -35,7 +31,7 @@ class DataAugmentationForVideoMAE(object):
             )
 
     def __call__(self, images):
-        process_data , _ = self.transform(images)
+        process_data, _ = self.transform(images)
         return process_data, self.masked_position_generator()
 
     def __repr__(self):
@@ -74,33 +70,21 @@ def get_args():
 
 def get_model(args):
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=False,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        decoder_depth=args.decoder_depth
-    )
-
+    model = tf.keras.models.load_model(args.model_path)
     return model
 
 
 def main(args):
     print(args)
 
-    device = torch.device(args.device)
-    cudnn.benchmark = True
+    device = args.device  # TensorFlow handles device placement automatically
+    tf.config.experimental.set_memory_growth(tf.config.list_physical_devices('GPU')[0], True)
 
     model = get_model(args)
-    patch_size = model.encoder.patch_embed.patch_size
+    patch_size = model.encoder.patch_embed.patch_size  # This needs to be adapted to your TF model
     print("Patch size = %s" % str(patch_size))
     args.window_size = (args.num_frames // 2, args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
-
-    model.to(device)
-    checkpoint = torch.load(args.model_path, map_location='cpu')
-    model.load_state_dict(checkpoint['model'])
-    model.eval()
 
     if args.save_path:
         Path(args.save_path).mkdir(parents=True, exist_ok=True)
@@ -111,74 +95,61 @@ def main(args):
     new_length  = 1 
     new_step = 1
     skip_length = new_length * new_step
-    # frame_id_list = [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61]
-
     
     tmp = np.arange(0,32, 2) + 60
     frame_id_list = tmp.tolist()
-    # average_duration = (duration - skip_length + 1) // args.num_frames
-    # if average_duration > 0:
-    #     frame_id_list = np.multiply(list(range(args.num_frames)),
-    #                             average_duration)
-    #     frame_id_list = frame_id_list + np.random.randint(average_duration,
-    #                                             size=args.num_frames)
 
     video_data = vr.get_batch(frame_id_list).asnumpy()
     print(video_data.shape)
     img = [Image.fromarray(video_data[vid, :, :, :]).convert('RGB') for vid, _ in enumerate(frame_id_list)]
 
     transforms = DataAugmentationForVideoMAE(args)
-    img, bool_masked_pos = transforms((img, None)) # T*C,H,W
-    # print(img.shape)
-    img = img.view((args.num_frames , 3) + img.size()[-2:]).transpose(0,1) # T*C,H,W -> T,C,H,W -> C,T,H,W
-    # img = img.view(( -1 , args.num_frames) + img.size()[-2:]) 
-    bool_masked_pos = torch.from_numpy(bool_masked_pos)
+    img, bool_masked_pos = transforms((img, None))  # T*C,H,W
+    img = rearrange(img, '(T C) H W -> T C H W', T=args.num_frames, C=3)
+    bool_masked_pos = tf.convert_to_tensor(bool_masked_pos, dtype=tf.bool)
 
-    with torch.no_grad():
-        # img = img[None, :]
-        # bool_masked_pos = bool_masked_pos[None, :]
-        img = img.unsqueeze(0)
-        print(img.shape)
-        bool_masked_pos = bool_masked_pos.unsqueeze(0)
-        
-        img = img.to(device, non_blocking=True)
-        bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).flatten(1).to(torch.bool)
-        outputs = model(img, bool_masked_pos)
+    img = tf.expand_dims(img, axis=0)
+    print(img.shape)
+    bool_masked_pos = tf.expand_dims(bool_masked_pos, axis=0)
 
-        #save original video
-        mean = torch.as_tensor(IMAGENET_DEFAULT_MEAN).to(device)[None, :, None, None, None]
-        std = torch.as_tensor(IMAGENET_DEFAULT_STD).to(device)[None, :, None, None, None]
-        ori_img = img * std + mean  # in [0, 1]
-        imgs = [ToPILImage()(ori_img[0,:,vid,:,:].cpu()) for vid, _ in enumerate(frame_id_list)  ]
-        for id, im in enumerate(imgs):
-            im.save(f"{args.save_path}/ori_img{id}.jpg")
+    img = tf.convert_to_tensor(img)
+    bool_masked_pos = tf.convert_to_tensor(bool_masked_pos)
 
-        img_squeeze = rearrange(ori_img, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2) c', p0=2, p1=patch_size[0], p2=patch_size[0])
-        img_norm = (img_squeeze - img_squeeze.mean(dim=-2, keepdim=True)) / (img_squeeze.var(dim=-2, unbiased=True, keepdim=True).sqrt() + 1e-6)
-        img_patch = rearrange(img_norm, 'b n p c -> b n (p c)')
-        img_patch[bool_masked_pos] = outputs
+    outputs = model([img, bool_masked_pos])
 
-        #make mask
-        mask = torch.ones_like(img_patch)
-        mask[bool_masked_pos] = 0
-        mask = rearrange(mask, 'b n (p c) -> b n p c', c=3)
-        mask = rearrange(mask, 'b (t h w) (p0 p1 p2) c -> b c (t p0) (h p1) (w p2) ', p0=2, p1=patch_size[0], p2=patch_size[1], h=14, w=14)
+    # Save original video
+    mean = tf.constant([IMAGENET_DEFAULT_MEAN], dtype=tf.float32)[:, :, None, None, None]
+    std = tf.constant([IMAGENET_DEFAULT_STD], dtype=tf.float32)[:, :, None, None, None]
+    ori_img = img * std + mean  # in [0, 1]
+    imgs = [array_to_img(ori_img[0, :, vid, :, :].numpy()) for vid, _ in enumerate(frame_id_list)]
+    for id, im in enumerate(imgs):
+        im.save(f"{args.save_path}/ori_img{id}.jpg")
 
-        #save reconstruction video
-        rec_img = rearrange(img_patch, 'b n (p c) -> b n p c', c=3)
-        # Notice: To visualize the reconstruction video, we add the predict and the original mean and var of each patch.
-        rec_img = rec_img * (img_squeeze.var(dim=-2, unbiased=True, keepdim=True).sqrt() + 1e-6) + img_squeeze.mean(dim=-2, keepdim=True)
-        rec_img = rearrange(rec_img, 'b (t h w) (p0 p1 p2) c -> b c (t p0) (h p1) (w p2)', p0=2, p1=patch_size[0], p2=patch_size[1], h=14, w=14)
-        imgs = [ ToPILImage()(rec_img[0, :, vid, :, :].cpu().clamp(0,0.996)) for vid, _ in enumerate(frame_id_list)  ]
+    img_squeeze = rearrange(ori_img, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2) c', p0=2, p1=patch_size[0], p2=patch_size[0])
+    img_norm = (img_squeeze - tf.reduce_mean(img_squeeze, axis=-2, keepdims=True)) / (tf.math.reduce_std(img_squeeze, axis=-2, keepdims=True) + 1e-6)
+    img_patch = rearrange(img_norm, 'b n p c -> b n (p c)')
+    img_patch = tf.tensor_scatter_nd_update(img_patch, bool_masked_pos, outputs)
 
-        for id, im in enumerate(imgs):
-            im.save(f"{args.save_path}/rec_img{id}.jpg")
+    # Make mask
+    mask = tf.ones_like(img_patch)
+    mask = tf.tensor_scatter_nd_update(mask, bool_masked_pos, tf.zeros_like(img_patch))
+    mask = rearrange(mask, 'b n (p c) -> b n p c', c=3)
+    mask = rearrange(mask, 'b (t h w) (p0 p1 p2) c -> b c (t p0) (h p1) (w p2)', p0=2, p1=patch_size[0], p2=patch_size[1], h=14, w=14)
 
-        #save masked video 
-        img_mask = rec_img * mask
-        imgs = [ToPILImage()(img_mask[0, :, vid, :, :].cpu()) for vid, _ in enumerate(frame_id_list)]
-        for id, im in enumerate(imgs):
-            im.save(f"{args.save_path}/mask_img{id}.jpg")
+    # Save reconstruction video
+    rec_img = rearrange(img_patch, 'b n (p c) -> b n p c', c=3)
+    rec_img = rec_img * (tf.math.reduce_std(img_squeeze, axis=-2, keepdims=True) + 1e-6) + tf.reduce_mean(img_squeeze, axis=-2, keepdims=True)
+    rec_img = rearrange(rec_img, 'b (t h w) (p0 p1 p2) c -> b c (t p0) (h p1) (w p2)', p0=2, p1=patch_size[0], p2=patch_size[1], h=14, w=14)
+    imgs = [array_to_img(tf.clip_by_value(rec_img[0, :, vid, :, :], 0, 0.996).numpy()) for vid, _ in enumerate(frame_id_list)]
+
+    for id, im in enumerate(imgs):
+        im.save(f"{args.save_path}/rec_img{id}.jpg")
+
+    # Save masked video 
+    img_mask = rec_img * mask
+    imgs = [array_to_img(img_mask[0, :, vid, :, :].numpy()) for vid, _ in enumerate(frame_id_list)]
+    for id, im in enumerate(imgs):
+        im.save(f"{args.save_path}/mask_img{id}.jpg")
 
 if __name__ == '__main__':
     opts = get_args()

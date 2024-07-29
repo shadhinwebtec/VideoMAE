@@ -1,35 +1,23 @@
-"""
-This implementation is based on
-https://github.com/rwightman/pytorch-image-models/blob/master/timm/data/random_erasing.py
-pulished under an Apache License 2.0.
-"""
 import math
 import random
-import torch
+import tensorflow as tf
 
 
-def _get_pixels(
-    per_pixel, rand_color, patch_size, dtype=torch.float32, device="cuda"
-):
-    # NOTE I've seen CUDA illegal memory access errors being caused by the normal_()
-    # paths, flip the order so normal is run on CPU if this becomes a problem
-    # Issue has been fixed in master https://github.com/pytorch/pytorch/issues/19508
+def _get_pixels(per_pixel, rand_color, patch_size, dtype=tf.float32, device="GPU"):
     if per_pixel:
-        return torch.empty(patch_size, dtype=dtype, device=device).normal_()
+        return tf.random.normal(shape=patch_size, dtype=dtype)
     elif rand_color:
-        return torch.empty(
-            (patch_size[0], 1, 1), dtype=dtype, device=device
-        ).normal_()
+        return tf.random.normal(shape=(patch_size[0], 1, 1), dtype=dtype)
     else:
-        return torch.zeros((patch_size[0], 1, 1), dtype=dtype, device=device)
+        return tf.zeros(shape=(patch_size[0], 1, 1), dtype=dtype)
 
 
 class RandomErasing:
     """Randomly selects a rectangle region in an image and erases its pixels.
-        'Random Erasing Data Augmentation' by Zhong et al.
-        See https://arxiv.org/pdf/1708.04896.pdf
-        This variant of RandomErasing is intended to be applied to either a batch
-        or single image tensor after it has been normalized by dataset mean and std.
+    'Random Erasing Data Augmentation' by Zhong et al.
+    See https://arxiv.org/pdf/1708.04896.pdf
+    This variant of RandomErasing is intended to be applied to either a batch
+    or single image tensor after it has been normalized by dataset mean and std.
     Args:
          probability: Probability that the Random Erasing operation will be performed.
          min_area: Minimum percentage of erased area wrt input image area.
@@ -54,7 +42,7 @@ class RandomErasing:
         min_count=1,
         max_count=None,
         num_splits=0,
-        device="cuda",
+        device="GPU",
         cube=True,
     ):
         self.probability = probability
@@ -79,7 +67,7 @@ class RandomErasing:
 
     def _erase(self, img, chan, img_h, img_w, dtype):
         if random.random() > self.probability:
-            return
+            return img
         area = img_h * img_w
         count = (
             self.min_count
@@ -97,14 +85,13 @@ class RandomErasing:
                 if w < img_w and h < img_h:
                     top = random.randint(0, img_h - h)
                     left = random.randint(0, img_w - w)
-                    img[:, top : top + h, left : left + w] = _get_pixels(
-                        self.per_pixel,
-                        self.rand_color,
-                        (chan, h, w),
-                        dtype=dtype,
-                        device=self.device,
+                    img = tf.tensor_scatter_nd_update(
+                        img,
+                        indices=[[i, top, left, j] for i in range(chan) for j in range(top, top + h) for k in range(left, left + w)],
+                        updates=tf.reshape(_get_pixels(self.per_pixel, self.rand_color, (chan, h, w), dtype=dtype), [-1])
                     )
                     break
+        return img
 
     def _erase_cube(
         self,
@@ -117,7 +104,7 @@ class RandomErasing:
         dtype,
     ):
         if random.random() > self.probability:
-            return
+            return img
         area = img_h * img_w
         count = (
             self.min_count
@@ -137,28 +124,25 @@ class RandomErasing:
                     left = random.randint(0, img_w - w)
                     for i in range(batch_start, batch_size):
                         img_instance = img[i]
-                        img_instance[
-                            :, top : top + h, left : left + w
-                        ] = _get_pixels(
-                            self.per_pixel,
-                            self.rand_color,
-                            (chan, h, w),
-                            dtype=dtype,
-                            device=self.device,
+                        img_instance = tf.tensor_scatter_nd_update(
+                            img_instance,
+                            indices=[[j, top, left, k] for j in range(chan) for k in range(top, top + h) for l in range(left, left + w)],
+                            updates=tf.reshape(_get_pixels(self.per_pixel, self.rand_color, (chan, h, w), dtype=dtype), [-1])
                         )
+                        img[i].assign(img_instance)
                     break
+        return img
 
     def __call__(self, input):
-        if len(input.size()) == 3:
-            self._erase(input, *input.size(), input.dtype)
+        if len(input.shape) == 3:
+            return self._erase(input, *input.shape, input.dtype)
         else:
-            batch_size, chan, img_h, img_w = input.size()
-            # skip first slice of batch if num_splits is set (for clean portion of samples)
+            batch_size, chan, img_h, img_w = input.shape
             batch_start = (
                 batch_size // self.num_splits if self.num_splits > 1 else 0
             )
             if self.cube:
-                self._erase_cube(
+                return self._erase_cube(
                     input,
                     batch_start,
                     batch_size,
@@ -169,5 +153,5 @@ class RandomErasing:
                 )
             else:
                 for i in range(batch_start, batch_size):
-                    self._erase(input[i], chan, img_h, img_w, input.dtype)
-        return input
+                    input[i].assign(self._erase(input[i], chan, img_h, img_w, input.dtype))
+            return input

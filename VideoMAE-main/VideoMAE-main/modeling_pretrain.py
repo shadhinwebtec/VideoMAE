@@ -1,289 +1,164 @@
+import tensorflow as tf
+from tensorflow import keras 
+from keras import layers, models, initializers
 import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
-from functools import partial
+import numpy as np
 
-from modeling_finetune import Block, _cfg, PatchEmbed, get_sinusoid_encoding_table
-from timm.models.registry import register_model
-from timm.models.layers import trunc_normal_ as __call_trunc_normal_
+def get_sinusoid_encoding_table(n_position, d_hid):
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
 
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
+    return tf.convert_to_tensor(sinusoid_table, dtype=tf.float32)
 
+def trunc_normal_(tensor, mean=0.0, std=1.0):
+    tensor = initializers.TruncatedNormal(mean=mean, stddev=std).initialize(tensor.shape)
+    return tensor
 
-def trunc_normal_(tensor, mean=0., std=1.):
-    __call_trunc_normal_(tensor, mean=mean, std=std, a=-std, b=std)
-
-
-__all__ = [
-    'pretrain_videomae_small_patch16_224',
-    'pretrain_videomae_base_patch16_224', 
-    'pretrain_videomae_large_patch16_224', 
-    'pretrain_videomae_huge_patch16_224',
-]
-
-
-class PretrainVisionTransformerEncoder(nn.Module):
-    """ Vision Transformer with support for patch or hybrid CNN input stage
-    """
+class PretrainVisionTransformerEncoder(tf.keras.Model):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None, tubelet_size=2, use_checkpoint=False,
+                 drop_path_rate=0., norm_layer=layers.LayerNormalization, init_values=None, tubelet_size=2, use_checkpoint=False,
                  use_learnable_pos_emb=False):
-        super().__init__()
+        super(PretrainVisionTransformerEncoder, self).__init__()
         self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,tubelet_size=tubelet_size)
+        self.num_features = self.embed_dim = embed_dim
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim, tubelet_size)
         num_patches = self.patch_embed.num_patches
         self.use_checkpoint = use_checkpoint
 
-
-        # TODO: Add the cls token
         if use_learnable_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+            self.pos_embed = self.add_weight("pos_embed", shape=(1, num_patches + 1, embed_dim), initializer='zeros')
         else:
-            # sine-cosine positional embeddings 
             self.pos_embed = get_sinusoid_encoding_table(num_patches, embed_dim)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values)
-            for i in range(depth)])
-        self.norm =  norm_layer(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.blocks = [Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                             drop=drop_rate, attn_drop=attn_drop_rate, drop_path=drop_path_rate, norm_layer=norm_layer,
+                             init_values=init_values) for _ in range(depth)]
+        self.norm = norm_layer(embed_dim)
+        self.head = layers.Dense(num_classes, input_dim=embed_dim) if num_classes > 0 else tf.identity()
 
         if use_learnable_pos_emb:
-            trunc_normal_(self.pos_embed, std=.02)
+            self.pos_embed = trunc_normal_(self.pos_embed, std=.02)
 
-        self.apply(self._init_weights)
-
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def get_num_layers(self):
-        return len(self.blocks)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token'}
-
-    def get_classifier(self):
-        return self.head
-
-    def reset_classifier(self, num_classes, global_pool=''):
-        self.num_classes = num_classes
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-    def forward_features(self, x, mask):
-        _, _, T, _, _ = x.shape
+    def call(self, x, mask=None):
         x = self.patch_embed(x)
-        
-        x = x + self.pos_embed.type_as(x).to(x.device).clone().detach()
 
-        B, _, C = x.shape
-        x_vis = x[~mask].reshape(B, -1, C) # ~mask means visible
+        if mask is not None:
+            x = x + tf.cast(self.pos_embed, x.dtype)
 
-        if self.use_checkpoint:
-            for blk in self.blocks:
-                x_vis = checkpoint.checkpoint(blk, x_vis)
-        else:   
+            B, _, C = x.shape
+            x_vis = tf.reshape(x[~mask], (B, -1, C))
+
             for blk in self.blocks:
                 x_vis = blk(x_vis)
 
-        x_vis = self.norm(x_vis)
-        return x_vis
+            x_vis = self.norm(x_vis)
+            return x_vis
+        else:
+            x = x + tf.cast(self.pos_embed, x.dtype)
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.norm(x)
+            return x
 
-    def forward(self, x, mask):
-        x = self.forward_features(x, mask)
-        x = self.head(x)
-        return x
-
-class PretrainVisionTransformerDecoder(nn.Module):
-    """ Vision Transformer with support for patch or hybrid CNN input stage
-    """
+class PretrainVisionTransformerDecoder(tf.keras.Model):
     def __init__(self, patch_size=16, num_classes=768, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
                  qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-                 norm_layer=nn.LayerNorm, init_values=None, num_patches=196, tubelet_size=2, use_checkpoint=False
-                 ):
-        super().__init__()
+                 norm_layer=layers.LayerNormalization, init_values=None, num_patches=196, tubelet_size=2, use_checkpoint=False):
+        super(PretrainVisionTransformerDecoder, self).__init__()
         self.num_classes = num_classes
-        assert num_classes == 3 * tubelet_size * patch_size ** 2 
-        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_features = self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.use_checkpoint = use_checkpoint
 
+        self.blocks = [Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                             drop=drop_rate, attn_drop=attn_drop_rate, drop_path=drop_path_rate, norm_layer=norm_layer,
+                             init_values=init_values) for _ in range(depth)]
+        self.norm = norm_layer(embed_dim)
+        self.head = layers.Dense(num_classes, input_dim=embed_dim) if num_classes > 0 else tf.identity()
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values)
-            for i in range(depth)])
-        self.norm =  norm_layer(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-        self.apply(self._init_weights)
-
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def get_num_layers(self):
-        return len(self.blocks)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token'}
-
-    def get_classifier(self):
-        return self.head
-
-    def reset_classifier(self, num_classes, global_pool=''):
-        self.num_classes = num_classes
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-    def forward(self, x, return_token_num):
-        if self.use_checkpoint:
-            for blk in self.blocks:
-                x = checkpoint.checkpoint(blk, x)
-        else:   
-            for blk in self.blocks:
-                x = blk(x)
+    def call(self, x, return_token_num=0):
+        for blk in self.blocks:
+            x = blk(x)
 
         if return_token_num > 0:
-            x = self.head(self.norm(x[:, -return_token_num:])) # only return the mask tokens predict pixels
+            x = self.head(self.norm(x[:, -return_token_num:]))
         else:
             x = self.head(self.norm(x))
 
         return x
 
-class PretrainVisionTransformer(nn.Module):
-    """ Vision Transformer with support for patch or hybrid CNN input stage
-    """
-    def __init__(self,
-                 img_size=224, 
-                 patch_size=16, 
-                 encoder_in_chans=3, 
-                 encoder_num_classes=0, 
-                 encoder_embed_dim=768, 
-                 encoder_depth=12,
-                 encoder_num_heads=12, 
-                 decoder_num_classes=1536, #  decoder_num_classes=768, 
-                 decoder_embed_dim=512, 
-                 decoder_depth=8,
-                 decoder_num_heads=8, 
-                 mlp_ratio=4., 
-                 qkv_bias=False, 
-                 qk_scale=None, 
-                 drop_rate=0., 
-                 attn_drop_rate=0.,
-                 drop_path_rate=0., 
-                 norm_layer=nn.LayerNorm, 
-                 init_values=0.,
-                 use_learnable_pos_emb=False,
-                 use_checkpoint=False,
-                 tubelet_size=2,
-                 num_classes=0, # avoid the error from create_fn in timm
-                 in_chans=0, # avoid the error from create_fn in timm
-                 ):
-        super().__init__()
-        self.encoder = PretrainVisionTransformerEncoder(
-            img_size=img_size, 
-            patch_size=patch_size, 
-            in_chans=encoder_in_chans, 
-            num_classes=encoder_num_classes, 
-            embed_dim=encoder_embed_dim, 
-            depth=encoder_depth,
-            num_heads=encoder_num_heads, 
-            mlp_ratio=mlp_ratio, 
-            qkv_bias=qkv_bias, 
-            qk_scale=qk_scale, 
-            drop_rate=drop_rate, 
-            attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate, 
-            norm_layer=norm_layer, 
-            init_values=init_values,
-            tubelet_size=tubelet_size,
-            use_checkpoint=use_checkpoint,
-            use_learnable_pos_emb=use_learnable_pos_emb)
-
-        self.decoder = PretrainVisionTransformerDecoder(
-            patch_size=patch_size, 
-            num_patches=self.encoder.patch_embed.num_patches,
-            num_classes=decoder_num_classes, 
-            embed_dim=decoder_embed_dim, 
-            depth=decoder_depth,
-            num_heads=decoder_num_heads, 
-            mlp_ratio=mlp_ratio, 
-            qkv_bias=qkv_bias, 
-            qk_scale=qk_scale, 
-            drop_rate=drop_rate, 
-            attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate, 
-            norm_layer=norm_layer, 
-            init_values=init_values,
-            tubelet_size=tubelet_size,
-            use_checkpoint=use_checkpoint)
-
-        self.encoder_to_decoder = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=False)
-
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-
+class PretrainVisionTransformer(tf.keras.Model):
+    def __init__(self, img_size=224, patch_size=16, encoder_in_chans=3, encoder_num_classes=0, encoder_embed_dim=768,
+                 encoder_depth=12, encoder_num_heads=12, decoder_num_classes=1536, decoder_embed_dim=512, decoder_depth=8,
+                 decoder_num_heads=8, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0., norm_layer=layers.LayerNormalization, init_values=0., use_learnable_pos_emb=False,
+                 use_checkpoint=False, tubelet_size=2):
+        super(PretrainVisionTransformer, self).__init__()
+        self.encoder = PretrainVisionTransformerEncoder(img_size=img_size, patch_size=patch_size, in_chans=encoder_in_chans,
+                                                        num_classes=encoder_num_classes, embed_dim=encoder_embed_dim, depth=encoder_depth,
+                                                        num_heads=encoder_num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                                        drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
+                                                        norm_layer=norm_layer, init_values=init_values, tubelet_size=tubelet_size,
+                                                        use_checkpoint=use_checkpoint, use_learnable_pos_emb=use_learnable_pos_emb)
+        self.decoder = PretrainVisionTransformerDecoder(patch_size=patch_size, num_classes=decoder_num_classes, embed_dim=decoder_embed_dim,
+                                                        depth=decoder_depth, num_heads=decoder_num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                                                        qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
+                                                        norm_layer=norm_layer, init_values=init_values, tubelet_size=tubelet_size, use_checkpoint=use_checkpoint,
+                                                        num_patches=self.encoder.patch_embed.num_patches)
+        self.encoder_to_decoder = layers.Dense(decoder_embed_dim, use_bias=False)
+        self.mask_token = self.add_weight("mask_token", shape=(1, 1, decoder_embed_dim), initializer='zeros')
         self.pos_embed = get_sinusoid_encoding_table(self.encoder.patch_embed.num_patches, decoder_embed_dim)
+        self.mask_token = trunc_normal_(self.mask_token, std=.02)
 
-        trunc_normal_(self.mask_token, std=.02)
-
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def get_num_layers(self):
-        return len(self.blocks)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed', 'cls_token', 'mask_token'}
-
-    def forward(self, x, mask):
-        _, _, T, _, _ = x.shape
-        x_vis = self.encoder(x, mask) # [B, N_vis, C_e]
-        x_vis = self.encoder_to_decoder(x_vis) # [B, N_vis, C_d]
+    def call(self, x, mask):
+        x_vis = self.encoder(x, mask)
+        x_vis = self.encoder_to_decoder(x_vis)
         B, N, C = x_vis.shape
-        # we don't unshuffle the correct visible token order, 
-        # but shuffle the pos embedding accorddingly.
-        expand_pos_embed = self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device).clone().detach()
-        pos_emd_vis = expand_pos_embed[~mask].reshape(B, -1, C)
-        pos_emd_mask = expand_pos_embed[mask].reshape(B, -1, C)
-        x_full = torch.cat([x_vis + pos_emd_vis, self.mask_token + pos_emd_mask], dim=1) # [B, N, C_d]
-        x = self.decoder(x_full, pos_emd_mask.shape[1]) # [B, N_mask, 3 * 16 * 16]
 
+        expand_pos_embed = tf.cast(self.pos_embed, x.dtype)
+        pos_emd_vis = tf.reshape(expand_pos_embed[~mask], (B, -1, C))
+        pos_emd_mask = tf.reshape(expand_pos_embed[mask], (B, -1, C))
+        x_full = tf.concat([x_vis + pos_emd_vis, self.mask_token + pos_emd_mask], axis=1)
+
+        x = self.decoder(x_full, pos_emd_mask.shape[1])
+        return x
+class PatchEmbed(tf.keras.layers.Layer):
+    def __init__(self, img_size, patch_size, in_chans, embed_dim, tubelet_size):
+        super(PatchEmbed, self).__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = layers.Conv2D(embed_dim, kernel_size=(patch_size, patch_size), strides=(patch_size, patch_size))
+
+    def call(self, x):
+        x = self.proj(x)
+        x = tf.reshape(x, [x.shape[0], -1, x.shape[-1]])
         return x
 
-@register_model
+class Block(tf.keras.layers.Layer):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., norm_layer=layers.LayerNormalization, init_values=None):
+        super(Block, self).__init__()
+        self.norm1 = norm_layer(epsilon=1e-6)
+        self.attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=dim, dropout=attn_drop)
+        self.drop_path = layers.Dropout(drop_path)
+        self.norm2 = norm_layer(epsilon=1e-6)
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(dim * mlp_ratio, activation='gelu'),
+            layers.Dropout(drop),
+            layers.Dense(dim),
+            layers.Dropout(drop)
+        ])
+
+    def call(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+    
 def pretrain_videomae_small_patch16_224(pretrained=False, **kwargs):
     model = PretrainVisionTransformer(
         img_size=224,
@@ -297,17 +172,10 @@ def pretrain_videomae_small_patch16_224(pretrained=False, **kwargs):
         decoder_num_heads=3,
         mlp_ratio=4,
         qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        norm_layer= partial(tf.keras.layers.LayerNormalization, epsilon=1e-6),
         **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.load(
-            kwargs["init_ckpt"], map_location="cpu"
-        )
-        model.load_state_dict(checkpoint["model"])
     return model
 
-@register_model
 def pretrain_videomae_base_patch16_224(pretrained=False, **kwargs):
     model = PretrainVisionTransformer(
         img_size=224,
@@ -321,17 +189,10 @@ def pretrain_videomae_base_patch16_224(pretrained=False, **kwargs):
         decoder_num_heads=6,
         mlp_ratio=4, 
         qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        norm_layer=partial(tf.keras.layers.LayerNormalization, epsilon=1e-6), 
         **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.load(
-            kwargs["init_ckpt"], map_location="cpu"
-        )
-        model.load_state_dict(checkpoint["model"])
     return model
- 
-@register_model
+
 def pretrain_videomae_large_patch16_224(pretrained=False, **kwargs):
     model = PretrainVisionTransformer(
         img_size=224,
@@ -345,17 +206,10 @@ def pretrain_videomae_large_patch16_224(pretrained=False, **kwargs):
         decoder_num_heads=8,
         mlp_ratio=4, 
         qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        norm_layer= partial(tf.keras.layers.LayerNormalization, epsilon=1e-6), 
         **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.load(
-            kwargs["init_ckpt"], map_location="cpu"
-        )
-        model.load_state_dict(checkpoint["model"])
     return model
 
-@register_model
 def pretrain_videomae_huge_patch16_224(pretrained=False, **kwargs):
     model = PretrainVisionTransformer(
         img_size=224,
@@ -369,12 +223,6 @@ def pretrain_videomae_huge_patch16_224(pretrained=False, **kwargs):
         decoder_num_heads=8,
         mlp_ratio=4, 
         qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        norm_layer=partial(tf.keras.layers.LayerNormalization, epsilon=1e-6), 
         **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        checkpoint = torch.load(
-            kwargs["init_ckpt"], map_location="cpu"
-        )
-        model.load_state_dict(checkpoint["model"])
     return model
